@@ -1,4 +1,4 @@
-# Notes on java persistence best practices
+# Notes on Java Persistence
 
 * The fear of database portability can lead to avoiding highly effective features just because they are not interchangeable across various database systems. In reality, it is more common to end up with a sluggish database layer than having to port an already running system to a new database solution.
 * [JPA](link) and [Hibernate](link) were never meant to substitute SQL, and [native queries](link) are unavoidable in any non-trivial enterprise application. While JPA makes it possible to abstract DML statements and common entity retrieval queries, when it comes to reading and processing data, nothing can beat native SQL.
@@ -53,4 +53,37 @@
   * optimizing the data layer to deliver lower transaction response times
   * scaling each replicated node to a cost-effective configuration
   * adding more replicated nodes until synchronization latencies start dropping below an acceptable threshold
+
+
+### JDBC Connection Management
+* The JDBC (Java Database Connectivity) API provides a common interface to communicate with the DB. All networking logic and DB-specific communication protocol are hidden behind the vendor-independent JDBC API. The `java.sql.Driver` is the entry point for interacting with the JDBC API, defining the implementation version details and providing access to a DB connection.
+* JDBC defines 4 driver types, of which the *Type 4* (communication protocol implemented solely in Java) is the preferred alternative being easier to setup and debug.
+* To communicate with the DB, a Java program first obtains a `java.sql.Connection`. Although the `java.sql.Driver` is the actual DB connection provider, it is more convenient to use the `java.sql.DriverManager` since it can also resolve the JDBC driver associated with the current database connection URL.
+* Every time the `getConnection()` method is called, the `DriverManager` requests a new physical connection from the underlying `Driver`.
+* In a typical enterprise application, the user *request throughput* is greater than the available *DB connection capacity*. As long as the *connection acquisition time* is tolerable, the requests can wait for a DB connection to become available. The middle layer acts as a *DB connection buffer* that can mitigate user request traffic spikes by increasing request response time, without depleting DB connections or discarding incoming traffic. Because the intermediate layer manages connections, the application server can also monitor connection usage and provide statistics to the operations team. For this reason, instead of serving physical connections, the application server provides only logical connections (proxies or handles), so it can intercept and register how the client API interacts with the connection object.
+* If the `DriverManager` is a *physical connection factory*, the `DataSource` interface is a *logical connection provider*. The simplest `DataSource` implementation could delegate connection acquisition requests to the underlying `DriverManager`, and the connection request workflow would look like this:
+  1. data layer asks the `DataSource` for a connection
+  2. `DataSource` uses the underlying driver to open a physical connection
+  3. a physical connection is created, and a TCP socket is opened
+  4. the `DataSource` under test does not wrap the physical connection, but lends it to the application layer
+  5. the application executes statements using the acquired connection
+  6. when the physical connection is no longer needed, it is closed along with the underlying TCP socket
+* Opening and closing connections is an expensive operation, so reusing them has the following advantages:
+  * avoid DB and driver overhead for establishing TCP connections
+  * prevent destroying temporary memory buffers associated with each connection
+  * reduce client-side JVM object garbage
+* When using a connection pooling solution, the connection acquisition time is between two and four orders of magnitude smaller (the overall transaction response time decreases too).
+
+
+#### Why is [pooling](https://www.baeldung.com/java-connection-pooling) so much faster?
+* The connection pooling mechanism works like this:
+  1. a connection is requested => the pool looks for unallocated connections
+  2. if a free connection exists => hand it to the client
+  3. if there are no free connections => the pool will try to grow to its max size
+  4. if the pool is already at its max size, it will retry several times before giving up with a *connection acquisition failure exception*
+  5. when the logical connection is closed, it is released to the pool without closing the underlying physical connection
+* The connection pool does not return the physical connection to the client, but instead it offers a proxy. When a connection is in use, its state is changed to **allocated** to prevent two concurrent threads from using the same connection. The proxy intercepts the connection close method call, and it notifies the pool to change the connection state to **unallocated**. Apart from reducing connection acquisition time, the pooling mechanism can also limit the number of connections an application can use at once. The connection pool acts as a *bounded buffer* for the incoming connection requests. If there is a traffic spike, the connection pool will level it, instead of saturating all the available DB resources.
+* Whenever the number of incoming requests surpasses available request handlers, there are two options to avoid system overloading:
+  * discard the overflowing traffic (affecting availability)
+  * queue requests and wait for busy resources to become available (increasing response time).
 
